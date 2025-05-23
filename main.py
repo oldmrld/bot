@@ -1,0 +1,381 @@
+import os
+import re
+import logging
+import json
+from pymystem3 import Mystem
+import ahocorasick
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, constants
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
+from dotenv import load_dotenv
+import asyncio
+from faster_whisper import WhisperModel
+from pydub import AudioSegment
+from collections import Counter
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+RECOGNITION_ENGINE = os.getenv('RECOGNITION_ENGINE', 'faster-whisper')
+RECOGNITION_ENGINE_OPTIONS = os.getenv('RECOGNITION_ENGINE_OPTIONS',
+                                       '{"model": "small", "language": "ru", "device": "cpu", "compute_type": "int8", "beam_size": 5}')
+
+# Инициализация лемматизатора
+mystem = Mystem()
+
+# Загрузка словаря ключевых слов
+A = ahocorasick.Automaton()
+
+def load_dictionary(dictionary_path='dictionary.txt'):
+    try:
+        A.clear()
+        with open(dictionary_path, 'r', encoding='utf-8') as file:
+            for line in file:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    word = line.split()[0]
+                    A.add_word(word, (word,))
+        A.make_automaton()
+        logger.info("Словарь ключевых слов загружен.")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка при загрузке словаря: {e}")
+        return False
+
+# Функции для работы с частотностью ключевых слов
+def load_word_frequency(frequency_path='word_frequency.json'):
+    try:
+        with open(frequency_path, 'r', encoding='utf-8') as file:
+            data = json.load(file)
+        logger.info("Частотность ключевых слов загружена.")
+        return data
+    except FileNotFoundError:
+        logger.info("Файл частотности не найден, создаем новый.")
+        return {}
+    except Exception as e:
+        logger.error(f"Ошибка при загрузке частотности: {e}")
+        return {}
+
+def save_word_frequency(word_frequency, frequency_path='word_frequency.json'):
+    try:
+        with open(frequency_path, 'w', encoding='utf-8') as file:
+            json.dump(word_frequency, file, ensure_ascii=False, indent=4)
+        logger.info("Частотность ключевых слов сохранена.")
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении частотности: {e}")
+
+# Функция для создания клавиатуры быстрого доступа
+def get_reply_keyboard():
+    keyboard = [
+        ['🎤 Распознать голос', '➕ Добавить слово'],
+        ['📊 Топ слов', 'ℹ️ Помощь', '🏷 О боте']
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+# Функция для создания инлайн-клавиатуры меню
+def get_menu_buttons():
+    keyboard = [
+        [
+            InlineKeyboardButton("🎤 Распознать голос", callback_data='voice'),
+            InlineKeyboardButton("➕ Добавить слово", callback_data='addword')
+        ],
+        [
+            InlineKeyboardButton("📊 Топ слов", callback_data='top_words'),
+            InlineKeyboardButton("📜 Словарь", callback_data='show_dictionary'),  # Новая кнопка
+            InlineKeyboardButton("ℹ️ Помощь", callback_data='help'),
+            InlineKeyboardButton("🏷 О боте", callback_data='about')
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# Функция для обработки команды /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        start_text = (
+            "Привет! Я бот для распознавания ключевых слов в голосовых сообщениях.\n\n"
+            "Что бы вы хотели сделать?"
+        )
+        await update.message.reply_text(start_text, reply_markup=get_menu_buttons(), parse_mode=constants.ParseMode.MARKDOWN)
+        logger.info("Команда /start обработана.")
+    except Exception as e:
+        logger.error(f"Ошибка при обработке команды /start: {e}")
+
+# Функция для обработки команды /help
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "Используйте команды:\n"
+        "- /start - вернуться в главное меню\n"
+        "- /help - помощь\n"
+        "- /about - информация о боте\n"
+        "- /addword <слово> - добавить ключевое слово"
+    )
+    await update.message.reply_text(help_text, reply_markup=get_reply_keyboard(), parse_mode=constants.ParseMode.MARKDOWN)
+
+# Функция для обработки команды /about
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    about_text = (
+        "Я бот для распознавания ключевых слов в голосовых сообщениях.\n"
+        "Использую распознавание речи и лемматизацию текста."
+    )
+    await update.message.reply_text(about_text, reply_markup=get_reply_keyboard(), parse_mode=constants.ParseMode.MARKDOWN)
+
+# Функция для обработки команды /addword
+async def add_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if context.args:
+            word = context.args[0].strip().lower()
+            if word:
+                with open('dictionary.txt', 'a', encoding='utf-8') as file:
+                    file.write(f"{word}\n")
+                if load_dictionary():
+                    await update.message.reply_text(f"Слово '{word}' успешно добавлено в словарь.", reply_markup=get_reply_keyboard())
+                    logger.info(f"Пользователь добавил слово: {word}")
+                else:
+                    await update.message.reply_text("Не удалось добавить слово. Попробуйте снова.", reply_markup=get_reply_keyboard())
+            else:
+                await update.message.reply_text("Пожалуйста, укажите слово для добавления.", reply_markup=get_reply_keyboard())
+        else:
+            await update.message.reply_text("Пожалуйста, укажите слово для добавления в формате: /addword <слово>", reply_markup=get_reply_keyboard())
+    except Exception as e:
+        logger.error(f"Ошибка при добавлении слова: {e}")
+        await update.message.reply_text("Произошла ошибка при добавлении слова. Попробуйте снова.", reply_markup=get_reply_keyboard())
+
+# Функция для обработки текстовых сообщений
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        message_text = update.message.text.lower()
+        if "привет" in message_text:
+            await update.message.reply_text("Привет! Как я могу помочь?", reply_markup=get_reply_keyboard())
+        elif "распознать голос" in message_text:
+            await update.message.reply_text("Отправьте мне голосовое сообщение, и я распознаю его.", reply_markup=get_reply_keyboard())
+        elif "добавить слово" in message_text:
+            await update.message.reply_text("Введите команду /addword <слово>, чтобы добавить ключевое слово.", reply_markup=get_reply_keyboard())
+        elif "помощь" in message_text:
+            help_text = (
+                "Помощь:\n"
+                "- Отправьте мне голосовое сообщение, и я распознаю текст и ключевые слова.\n"
+                "- Используйте команду /addword <слово> для добавления ключевых слов.\n"
+                "- Используйте /start для возврата в главное меню."
+            )
+            await update.message.reply_text(help_text, reply_markup=get_reply_keyboard(), parse_mode=constants.ParseMode.MARKDOWN)
+        elif "о боте" in message_text:
+            about_text = (
+                "VoiceKeywordBot использует передовые технологии для распознавания ключевых слов в голосовых сообщениях. Бот:\n\n"
+                "1. Преобразует голосовые сообщения в текст с помощью **Faster Whisper**, обеспечивая высокую точность распознавания на русском языке.\n"
+                "2. Обрабатывает текст с использованием **pymystem3** для лемматизации, улучшая поиск ключевых слов.\n"
+                "3. Применяет алгоритм **Aho-Corasick** для быстрого и точного поиска ключевых слов в сообщении.\n"
+                "4. Позволяет пользователям добавлять свои ключевые слова в словарь, расширяя функциональность.\n\n"
+                "Этот подход обеспечивает эффективную работу с голосовыми сообщениями, улучшая взаимодействие и автоматизацию процессов."
+            )
+            await update.message.reply_text(about_text, reply_markup=get_reply_keyboard(), parse_mode=constants.ParseMode.MARKDOWN)
+        elif "топ слов" in message_text:
+            word_frequency = load_word_frequency()
+            if word_frequency:
+                most_common_words = Counter(word_frequency).most_common(5)
+                top_words_text = (
+                    "Топ-5 ключевых слов:\n"
+                    + "\n".join([f"{word} ({count})" for word, count in most_common_words])
+                )
+                await update.message.reply_text(top_words_text, parse_mode=constants.ParseMode.MARKDOWN)
+            else:
+                await update.message.reply_text("Топ-5 ключевых слов не найдены.", parse_mode=constants.ParseMode.MARKDOWN)
+        elif "словарь" in message_text:
+            try:
+                with open('dictionary.txt', 'r', encoding='utf-8') as file:
+                    words = file.readlines()
+                words = [word.strip() for word in words if word.strip()]
+                if words:
+                    dictionary_text = "Словарь ключевых слов:\n" + "\n".join(words)
+                else:
+                    dictionary_text = "Словарь ключевых слов пуст."
+                await update.message.reply_text(dictionary_text, parse_mode=constants.ParseMode.MARKDOWN, reply_markup=get_reply_keyboard())
+            except Exception as e:
+                logger.error(f"Ошибка при выводе словаря: {e}")
+                await update.message.reply_text("Произошла ошибка при выводе словаря.", reply_markup=get_reply_keyboard())
+        else:
+            await update.message.reply_text("Пожалуйста, используйте кнопки для навигации.", reply_markup=get_reply_keyboard())
+    except Exception as e:
+        logger.error(f"Ошибка при обработке текстового сообщения: {e}")
+
+# Функция для обработки кнопок меню
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+
+    if data == 'voice':
+        await query.edit_message_text("Отправьте мне голосовое сообщение, и я распознаю его.")
+    elif data == 'help':
+        help_text = (
+            "Помощь:\n"
+            "- Отправьте мне голосовое сообщение, и я распознаю текст и ключевые слова.\n"
+            "- Используйте команду /addword <слово> для добавления ключевых слов.\n"
+            "- Используйте /start для возврата в главное меню."
+        )
+        await query.edit_message_text(help_text, parse_mode=constants.ParseMode.MARKDOWN)
+    elif data == 'about':
+        about_text = (
+            "VoiceKeywordBot использует передовые технологии для распознавания ключевых слов в голосовых сообщениях. Бот:\n\n"
+            "1. Преобразует голосовые сообщения в текст с помощью **Faster Whisper**, обеспечивая высокую точность распознавания на русском языке.\n"
+            "2. Обрабатывает текст с использованием **pymystem3** для лемматизации, улучшая поиск ключевых слов.\n"
+            "3. Применяет алгоритм **Aho-Corasick** для быстрого и точного поиска ключевых слов в сообщении.\n"
+            "4. Позволяет пользователям добавлять свои ключевые слова в словарь, расширяя функциональность.\n\n"
+            "Этот подход обеспечивает эффективную работу с голосовыми сообщениями, улучшая взаимодействие и автоматизацию процессов."
+        )
+        await query.edit_message_text(about_text, parse_mode=constants.ParseMode.MARKDOWN)
+    elif data == 'addword':
+        await query.edit_message_text("Введите команду /addword <слово>, чтобы добавить ключевое слово.")
+    elif data == 'top_words':
+        word_frequency = load_word_frequency()
+        if word_frequency:
+            most_common_words = Counter(word_frequency).most_common(5)
+            top_words_text = (
+                "Топ-5 ключевых слов:\n"
+                + "\n".join([f"{word} ({count})" for word, count in most_common_words])
+            )
+            await query.edit_message_text(top_words_text, parse_mode=constants.ParseMode.MARKDOWN)
+        else:
+            await query.edit_message_text("Топ-5 ключевых слов не найдены.", parse_mode=constants.ParseMode.MARKDOWN)
+    elif data == 'show_dictionary':
+        try:
+            with open('dictionary.txt', 'r', encoding='utf-8') as file:
+                words = file.readlines()
+            words = [word.strip() for word in words if word.strip()]
+            if words:
+                dictionary_text = "Словарь ключевых слов:\n" + "\n".join(words)
+            else:
+                dictionary_text = "Словарь ключевых слов пуст."
+            await query.edit_message_text(dictionary_text, parse_mode=constants.ParseMode.MARKDOWN, reply_markup=get_menu_buttons())
+        except Exception as e:
+            logger.error(f"Ошибка при выводе словаря: {e}")
+            await query.edit_message_text("Произошла ошибка при выводе словаря.", reply_markup=get_menu_buttons())
+    else:
+        await query.edit_message_text("Неизвестная команда.")
+
+# Функция для обработки голосовых сообщений
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if update.message.voice:
+            await update.message.reply_text("Голосовое сообщение принято, и я его обрабатываю.", reply_markup=get_reply_keyboard())
+            await handle_voice_message_logic(update, context)
+        else:
+            await update.message.reply_text("Пожалуйста, отправьте голосовое сообщение.", reply_markup=get_reply_keyboard())
+    except Exception as e:
+        logger.error(f"Ошибка при обработке голосового сообщения: {e}")
+
+# Логика обработки голосового сообщения
+async def handle_voice_message_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if update.message.voice:
+            logger.info("Получено голосовое сообщение.")
+            # Получение голосового сообщения
+            file = await update.message.voice.get_file()
+            oga_path = await file.download_to_drive()
+            wav_path = "converted_audio.wav"
+
+            # Преобразование аудио
+            audio = AudioSegment.from_ogg(oga_path)
+            audio.export(wav_path, format="wav")
+            logger.info("Аудио преобразовано.")
+
+            # Распознавание речи
+            if RECOGNITION_ENGINE == 'faster-whisper':
+                model_params = json.loads(RECOGNITION_ENGINE_OPTIONS)
+                model_size_or_path = model_params.pop('model')
+                model = WhisperModel(model_size_or_path, device=model_params.get('device', 'cpu'),
+                                     compute_type=model_params.get('compute_type', 'int8'))
+
+                # Запускаем распознавание
+                segments, _ = model.transcribe(wav_path, language='ru', beam_size=model_params.get('beam_size', 5))
+
+                # Извлекаем текст
+                text = ''.join(segment.text for segment in segments) if segments else ""
+
+                if not text.strip():
+                    logger.error("Ошибка: распознанный текст пуст.")
+                    await update.message.reply_text("Не удалось распознать голосовое сообщение. Попробуйте снова.", reply_markup=get_reply_keyboard())
+                    return
+
+                # Лемматизация текста
+                lemmas = mystem.lemmatize(text.lower())
+                lemmatized_text = ''.join(lemmas).strip()
+                logger.info(f"Текст после лемматизации: {lemmatized_text}")
+
+                # Поиск ключевых слов
+                found_words = []
+                for end_index, (word,) in A.iter(lemmatized_text):
+                    found_words.append(word)
+                found_words = list(set(found_words))
+                logger.info(f"Найденные ключевые слова: {found_words}")
+
+                # Анализ частоты ключевых слов
+                word_count = Counter(found_words)
+                most_common_words = word_count.most_common(5)
+
+                # Загрузка текущей частотности
+                word_frequency = load_word_frequency()
+
+                # Обновление частотности
+                for word in found_words:
+                    if word in word_frequency:
+                        word_frequency[word] += 1
+                    else:
+                        word_frequency[word] = 1
+
+                # Сохранение обновленной частотности
+                save_word_frequency(word_frequency)
+
+                # Отправка распознанного текста и анализа ключевых слов
+                response_text = (f"Распознанный текст:\n```{text}```\n\n"
+                                 f"Найденные ключевые слова: {', '.join(found_words) if found_words else 'Ключевые слова не найдены.'}\n\n")
+                await update.message.reply_text(response_text, parse_mode=constants.ParseMode.MARKDOWN, reply_markup=get_reply_keyboard())
+        else:
+            await update.message.reply_text("Пожалуйста, отправьте голосовое сообщение.", reply_markup=get_reply_keyboard())
+    except Exception as e:
+        logger.error(f"Ошибка при обработке голосового сообщения: {e}")
+
+def main():
+    try:
+        application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+        # Обработчики команд
+        start_handler = CommandHandler('start', start)
+        help_handler = CommandHandler('help', help_command)
+        about_handler = CommandHandler('about', about_command)
+        add_word_handler = CommandHandler('addword', add_word)
+
+        # Добавление обработчиков
+        application.add_handler(start_handler)
+        application.add_handler(help_handler)
+        application.add_handler(about_handler)
+        application.add_handler(add_word_handler)
+
+        # Обработчик для голосовых сообщений
+        voice_handler = MessageHandler(filters.VOICE, handle_voice_message)
+        application.add_handler(voice_handler)
+
+        # Обработчик для текстовых сообщений
+        text_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
+        application.add_handler(text_handler)
+
+        # Обработчик для нажатия кнопок
+        button_handler = CallbackQueryHandler(button)
+        application.add_handler(button_handler)
+
+        # Перезагружаем словарь при запуске
+        if load_dictionary():
+            application.run_polling()
+        else:
+            logger.error("Не удалось загрузить словарь. Бот остановлен.")
+    except Exception as e:
+        logger.error(f"Ошибка при запуске бота: {e}")
+
+if __name__ == '__main__':
+    main()
