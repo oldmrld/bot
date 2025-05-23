@@ -4,4 +4,3 @@ pydub
 faster-whisper
 ctranslate2
 pymystem3
-ahocorasick
